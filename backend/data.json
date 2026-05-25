@@ -1,0 +1,18 @@
+{
+  "grid": {
+    "width": 23,
+    "height": 18,
+    "cells": {}
+  },
+  "pcs": [
+    {
+      "id": "5d72d61d-b29b-4c5d-898c-bf8e3893075e",
+      "name": "derbo",
+      "ip": "10.0.20.105",
+      "sshUser": "bob",
+      "sshPort": 22,
+      "row": 3,
+      "col": 3
+    }
+  ]
+}
