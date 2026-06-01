@@ -21,6 +21,7 @@ export default function MachineModal({ machine, onClose, onSaved }: Props) {
   const [sshKey, setSshKey] = useState(machine.ssh_key_path ?? '')
   const [sshPass, setSshPass] = useState(machine.ssh_password ?? '')
   const [notes, setNotes] = useState(machine.notes ?? '')
+  const [color, setColor] = useState(machine.color ?? '#6b7280')
   const [error, setError] = useState('')
 
   const submit = async () => {
@@ -33,6 +34,7 @@ export default function MachineModal({ machine, onClose, onSaved }: Props) {
       ssh_key_path: authType === 'key' ? sshKey.trim() : '',
       ssh_password: authType === 'password' ? sshPass : '',
       notes: notes.trim(),
+      color,
     }
     try {
       if (isEdit && machine.id) await updateMachine(machine.id, data)
@@ -94,6 +96,21 @@ export default function MachineModal({ machine, onClose, onSaved }: Props) {
           ) : (
             <Field label="Chemin vers la clé SSH" value={sshKey} onChange={setSshKey} placeholder="/home/user/.ssh/id_rsa" />
           )}
+
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">Couleur (catégorie)</label>
+            <div className="flex items-center gap-2 flex-wrap">
+              {['#6b7280','#3b82f6','#22c55e','#ef4444','#f59e0b','#8b5cf6','#ec4899','#06b6d4','#f97316','#14b8a6'].map(c => (
+                <button key={c} onClick={() => setColor(c)} style={{
+                  width: 22, height: 22, borderRadius: 4, backgroundColor: c, flexShrink: 0,
+                  outline: color === c ? '2px solid white' : '2px solid transparent',
+                  outlineOffset: 1,
+                }} />
+              ))}
+              <input type="color" value={color} onChange={e => setColor(e.target.value)}
+                style={{ width: 22, height: 22, padding: 0, border: 'none', borderRadius: 4, cursor: 'pointer', flexShrink: 0 }} />
+            </div>
+          </div>
 
           <div>
             <label className="block text-xs text-gray-400 mb-1">Notes</label>

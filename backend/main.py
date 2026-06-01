@@ -1,12 +1,14 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Dict, List, Optional
+from typing import Any, Dict, List
 import asyncio
 import aiosqlite
 import json
+import os
 import shlex
 import shutil
 import socket
@@ -14,10 +16,19 @@ import subprocess
 import uuid
 from pathlib import Path
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    asyncio.create_task(ping_loop())
+    yield
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 DB = Path(__file__).parent / "uptoco.db"
+UPLOADS = Path(__file__).parent / "uploads"
+UPLOADS.mkdir(exist_ok=True)
 
 
 # ── Schema ──────────────────────────────────────────────────────────────────
@@ -33,7 +44,8 @@ CREATE TABLE IF NOT EXISTS machines (
     ssh_auth_type TEXT DEFAULT 'password',
     ssh_key_path TEXT DEFAULT '',
     ssh_password TEXT DEFAULT '',
-    notes TEXT DEFAULT ''
+    notes TEXT DEFAULT '',
+    color TEXT DEFAULT '#6b7280'
 );
 CREATE TABLE IF NOT EXISTS floors (
     id TEXT PRIMARY KEY,
@@ -42,37 +54,56 @@ CREATE TABLE IF NOT EXISTS floors (
 );
 CREATE TABLE IF NOT EXISTS floor_plans (
     floor_id TEXT PRIMARY KEY REFERENCES floors(id) ON DELETE CASCADE,
-    width INTEGER DEFAULT 25,
-    height INTEGER DEFAULT 18,
-    cells TEXT DEFAULT '{}',
-    labels TEXT DEFAULT '[]',
-    borders TEXT DEFAULT '{}',
-    rects TEXT DEFAULT '[]'
+    image_path TEXT
 );
 CREATE TABLE IF NOT EXISTS placed_machines (
     id TEXT PRIMARY KEY,
     machine_id TEXT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
     floor_id TEXT NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
-    row_pos INTEGER NOT NULL,
-    col_pos INTEGER NOT NULL,
-    UNIQUE(floor_id, row_pos, col_pos)
+    x REAL NOT NULL DEFAULT 0.5,
+    y REAL NOT NULL DEFAULT 0.5,
+    scale REAL NOT NULL DEFAULT 1.0,
+    UNIQUE(floor_id, machine_id)
 );
 """
+
+MIGRATIONS = [
+    "ALTER TABLE floor_plans ADD COLUMN image_path TEXT",
+    "ALTER TABLE placed_machines ADD COLUMN x REAL DEFAULT 0.5",
+    "ALTER TABLE placed_machines ADD COLUMN y REAL DEFAULT 0.5",
+    "ALTER TABLE placed_machines ADD COLUMN scale REAL DEFAULT 1.0",
+    "ALTER TABLE machines ADD COLUMN color TEXT DEFAULT '#6b7280'",
+]
 
 
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.executescript(SCHEMA)
-        # Migrations for existing databases
-        for migration in [
-            "ALTER TABLE floor_plans ADD COLUMN borders TEXT DEFAULT '{}'",
-            "ALTER TABLE floor_plans ADD COLUMN rects TEXT DEFAULT '[]'",
-        ]:
+        for migration in MIGRATIONS:
             try:
                 await db.execute(migration)
                 await db.commit()
             except Exception:
                 pass
+        # Reconstruit placed_machines si les anciennes colonnes row_pos/col_pos sont présentes
+        async with db.execute("PRAGMA table_info(placed_machines)") as c:
+            existing_cols = {row[1] for row in await c.fetchall()}
+        if "row_pos" in existing_cols or "col_pos" in existing_cols:
+            await db.executescript("""
+                CREATE TABLE IF NOT EXISTS _placed_machines_new (
+                    id TEXT PRIMARY KEY,
+                    machine_id TEXT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+                    floor_id TEXT NOT NULL REFERENCES floors(id) ON DELETE CASCADE,
+                    x REAL NOT NULL DEFAULT 0.5,
+                    y REAL NOT NULL DEFAULT 0.5,
+                    scale REAL NOT NULL DEFAULT 1.0,
+                    UNIQUE(floor_id, machine_id)
+                );
+                INSERT OR IGNORE INTO _placed_machines_new
+                    SELECT id, machine_id, floor_id, x, y, COALESCE(scale, 1.0) FROM placed_machines;
+                DROP TABLE placed_machines;
+                ALTER TABLE _placed_machines_new RENAME TO placed_machines;
+            """)
 
 
 def row_factory(cursor, row):
@@ -91,6 +122,7 @@ class MachineIn(BaseModel):
     ssh_key_path: str = ""
     ssh_password: str = ""
     notes: str = ""
+    color: str = "#6b7280"
 
 
 class FloorIn(BaseModel):
@@ -98,37 +130,25 @@ class FloorIn(BaseModel):
     position: int = 0
 
 
-class CellsBody(BaseModel):
-    cells: dict
-
-
-class LabelsBody(BaseModel):
-    labels: list
-
-
-class BordersBody(BaseModel):
-    borders: dict
-
-
-class RectsBody(BaseModel):
-    rects: list
-
-
-class SizeBody(BaseModel):
-    width: int
-    height: int
-
-
 class PlaceMachineBody(BaseModel):
     machine_id: str
-    row: int
-    col: int
+    x: float = 0.5
+    y: float = 0.5
+
+
+class MoveMachineBody(BaseModel):
+    x: float
+    y: float
+
+
+class ScaleMachineBody(BaseModel):
+    scale: float
 
 
 class ImportBody(BaseModel):
-    machines: list
-    floors: list
-    plans: list
+    machines: List[Dict[str, Any]]
+    floors: List[Dict[str, Any]]
+    plans: List[Dict[str, Any]]
 
 
 # ── Startup ──────────────────────────────────────────────────────────────────
@@ -137,10 +157,11 @@ connections: List[WebSocket] = []
 pc_statuses: Dict[str, bool] = {}
 
 
-@app.on_event("startup")
-async def startup():
-    await init_db()
-    asyncio.create_task(ping_loop())
+
+
+# ── Static uploads ────────────────────────────────────────────────────────────
+
+app.mount("/uploads", StaticFiles(directory=UPLOADS), name="uploads")
 
 
 # ── Machines ──────────────────────────────────────────────────────────────────
@@ -158,9 +179,9 @@ async def create_machine(m: MachineIn):
     mid = str(uuid.uuid4())
     async with aiosqlite.connect(DB) as db:
         await db.execute(
-            "INSERT INTO machines VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO machines VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (mid, m.name, m.type, m.ip, m.ssh_user, m.ssh_port,
-             m.ssh_auth_type, m.ssh_key_path, m.ssh_password, m.notes),
+             m.ssh_auth_type, m.ssh_key_path, m.ssh_password, m.notes, m.color),
         )
         await db.commit()
     return {"id": mid, **m.model_dump()}
@@ -171,9 +192,9 @@ async def update_machine(mid: str, m: MachineIn):
     async with aiosqlite.connect(DB) as db:
         await db.execute(
             "UPDATE machines SET name=?,type=?,ip=?,ssh_user=?,ssh_port=?,"
-            "ssh_auth_type=?,ssh_key_path=?,ssh_password=?,notes=? WHERE id=?",
+            "ssh_auth_type=?,ssh_key_path=?,ssh_password=?,notes=?,color=? WHERE id=?",
             (m.name, m.type, m.ip, m.ssh_user, m.ssh_port,
-             m.ssh_auth_type, m.ssh_key_path, m.ssh_password, m.notes, mid),
+             m.ssh_auth_type, m.ssh_key_path, m.ssh_password, m.notes, m.color, mid),
         )
         await db.commit()
     return {"id": mid, **m.model_dump()}
@@ -234,66 +255,31 @@ async def get_plan(fid: str):
         if not plan:
             raise HTTPException(404, "Plan introuvable")
         async with db.execute(
-            "SELECT pm.id, pm.machine_id, pm.floor_id, pm.row_pos, pm.col_pos,"
-            " m.name, m.type, m.ip FROM placed_machines pm"
+            "SELECT pm.id, pm.machine_id, pm.floor_id, pm.x, pm.y, pm.scale,"
+            " m.name, m.type, m.ip, m.color FROM placed_machines pm"
             " JOIN machines m ON pm.machine_id=m.id WHERE pm.floor_id=?", (fid,)
         ) as c:
             placed_machines = await c.fetchall()
+    image_path = plan.get("image_path")
     return {
         "floor_id": plan["floor_id"],
-        "width": plan["width"],
-        "height": plan["height"],
-        "cells": json.loads(plan["cells"]),
-        "labels": json.loads(plan["labels"]),
-        "borders": json.loads(plan["borders"] or "{}"),
-        "rects": json.loads(plan["rects"] or "[]"),
+        "image_url": f"/uploads/{image_path}" if image_path else None,
         "placed_machines": placed_machines,
     }
 
 
-@app.put("/api/floors/{fid}/plan/cells")
-async def save_cells(fid: str, body: CellsBody):
+@app.post("/api/floors/{fid}/plan/image")
+async def upload_image(fid: str, file: UploadFile = File(...)):
+    ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
+    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".bmp"}:
+        raise HTTPException(400, "Format d'image non supporté")
+    filename = f"{fid}{ext}"
+    content = await file.read()
+    (UPLOADS / filename).write_bytes(content)
     async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE floor_plans SET cells=? WHERE floor_id=?",
-                         (json.dumps(body.cells), fid))
+        await db.execute("UPDATE floor_plans SET image_path=? WHERE floor_id=?", (filename, fid))
         await db.commit()
-    return {"ok": True}
-
-
-@app.put("/api/floors/{fid}/plan/labels")
-async def save_labels(fid: str, body: LabelsBody):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE floor_plans SET labels=? WHERE floor_id=?",
-                         (json.dumps(body.labels), fid))
-        await db.commit()
-    return {"ok": True}
-
-
-@app.put("/api/floors/{fid}/plan/borders")
-async def save_borders(fid: str, body: BordersBody):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE floor_plans SET borders=? WHERE floor_id=?",
-                         (json.dumps(body.borders), fid))
-        await db.commit()
-    return {"ok": True}
-
-
-@app.put("/api/floors/{fid}/plan/rects")
-async def save_rects(fid: str, body: RectsBody):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE floor_plans SET rects=? WHERE floor_id=?",
-                         (json.dumps(body.rects), fid))
-        await db.commit()
-    return {"ok": True}
-
-
-@app.put("/api/floors/{fid}/plan/size")
-async def save_size(fid: str, body: SizeBody):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE floor_plans SET width=?,height=? WHERE floor_id=?",
-                         (body.width, body.height, fid))
-        await db.commit()
-    return {"ok": True}
+    return {"ok": True, "url": f"/uploads/{filename}"}
 
 
 @app.post("/api/floors/{fid}/plan/machines")
@@ -305,12 +291,33 @@ async def place_machine(fid: str, body: PlaceMachineBody):
             (fid, body.machine_id),
         )
         await db.execute(
-            "INSERT OR REPLACE INTO placed_machines (id,machine_id,floor_id,row_pos,col_pos)"
-            " VALUES (?,?,?,?,?)",
-            (pid, body.machine_id, fid, body.row, body.col),
+            "INSERT INTO placed_machines (id, machine_id, floor_id, x, y) VALUES (?,?,?,?,?)",
+            (pid, body.machine_id, fid, body.x, body.y),
         )
         await db.commit()
     return {"ok": True, "id": pid}
+
+
+@app.put("/api/floors/{fid}/plan/machines/{machine_id}/position")
+async def move_machine(fid: str, machine_id: str, body: MoveMachineBody):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE placed_machines SET x=?, y=? WHERE floor_id=? AND machine_id=?",
+            (body.x, body.y, fid, machine_id),
+        )
+        await db.commit()
+    return {"ok": True}
+
+
+@app.put("/api/floors/{fid}/plan/machines/{machine_id}/scale")
+async def scale_machine(fid: str, machine_id: str, body: ScaleMachineBody):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE placed_machines SET scale=? WHERE floor_id=? AND machine_id=?",
+            (max(0.5, min(3.0, body.scale)), fid, machine_id),
+        )
+        await db.commit()
+    return {"ok": True}
 
 
 @app.delete("/api/floors/{fid}/plan/machines/{machine_id}")
@@ -339,18 +346,13 @@ async def export_data():
             async with db.execute("SELECT * FROM floor_plans WHERE floor_id=?", (f["id"],)) as c:
                 plan = await c.fetchone()
             async with db.execute(
-                "SELECT id, machine_id, floor_id, row_pos, col_pos"
-                " FROM placed_machines WHERE floor_id=?", (f["id"],)
+                "SELECT id, machine_id, floor_id, x, y FROM placed_machines WHERE floor_id=?", (f["id"],)
             ) as c:
                 placed = await c.fetchall()
             if plan:
                 plans.append({
                     "floor_id": plan["floor_id"],
-                    "width": plan["width"],
-                    "height": plan["height"],
-                    "cells": json.loads(plan["cells"]),
-                    "labels": json.loads(plan["labels"]),
-                    "borders": json.loads(plan["borders"] or "{}"),
+                    "image_path": plan.get("image_path"),
                     "placed_machines": placed,
                 })
     return {"machines": machines, "floors": floors, "plans": plans}
@@ -365,28 +367,25 @@ async def import_data(body: ImportBody):
         await db.execute("DELETE FROM machines")
         for m in body.machines:
             await db.execute(
-                "INSERT INTO machines VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO machines VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (m["id"], m["name"], m["type"], m.get("ip", ""), m.get("ssh_user", "root"),
                  m.get("ssh_port", 22), m.get("ssh_auth_type", "password"),
-                 m.get("ssh_key_path", ""), m.get("ssh_password", ""), m.get("notes", "")),
+                 m.get("ssh_key_path", ""), m.get("ssh_password", ""), m.get("notes", ""),
+                 m.get("color", "#6b7280")),
             )
         for f in body.floors:
             await db.execute("INSERT INTO floors VALUES (?,?,?)", (f["id"], f["name"], f["position"]))
         for p in body.plans:
-            cells = json.dumps(p["cells"]) if isinstance(p["cells"], dict) else p["cells"]
-            labels = json.dumps(p["labels"]) if isinstance(p["labels"], list) else p["labels"]
-            borders_val = p.get("borders", {})
-            borders = json.dumps(borders_val) if isinstance(borders_val, dict) else borders_val
-            rects_val = p.get("rects", [])
-            rects = json.dumps(rects_val) if isinstance(rects_val, list) else rects_val
             await db.execute(
-                "INSERT INTO floor_plans (floor_id, width, height, cells, labels, borders, rects) VALUES (?,?,?,?,?,?,?)",
-                (p["floor_id"], p["width"], p["height"], cells, labels, borders, rects),
+                "INSERT INTO floor_plans (floor_id, image_path) VALUES (?,?)",
+                (p["floor_id"], p.get("image_path")),
             )
             for pm in p.get("placed_machines", []):
+                x = pm.get("x", pm.get("col_pos", 0.5) if isinstance(pm.get("col_pos"), float) else 0.5)
+                y = pm.get("y", pm.get("row_pos", 0.5) if isinstance(pm.get("row_pos"), float) else 0.5)
                 await db.execute(
-                    "INSERT INTO placed_machines (id,machine_id,floor_id,row_pos,col_pos) VALUES (?,?,?,?,?)",
-                    (pm["id"], pm["machine_id"], pm["floor_id"], pm["row_pos"], pm["col_pos"]),
+                    "INSERT INTO placed_machines (id, machine_id, floor_id, x, y) VALUES (?,?,?,?,?)",
+                    (pm["id"], pm["machine_id"], pm["floor_id"], x, y),
                 )
         await db.commit()
     return {"ok": True}
@@ -405,29 +404,63 @@ async def open_ssh(machine_id: str):
 
     user, host, port = m["ssh_user"] or "root", m["ip"], m["ssh_port"] or 22
 
+    sshpass_env: Dict[str, str] = {}
     if m["ssh_auth_type"] == "key" and m["ssh_key_path"]:
         ssh_cmd = f"ssh -i {shlex.quote(m['ssh_key_path'])} {user}@{host} -p {port}"
     elif m["ssh_auth_type"] == "password" and m["ssh_password"]:
         if not shutil.which("sshpass"):
             return {"error": "sshpass n'est pas installé. Lancez : sudo apt install sshpass"}
-        ssh_cmd = f"sshpass -p {shlex.quote(m['ssh_password'])} ssh -o StrictHostKeyChecking=no {user}@{host} -p {port}"
+        # Utilise SSHPASS env var (-e) pour ne pas exposer le mot de passe dans ps aux
+        sshpass_env = {"SSHPASS": m["ssh_password"]}
+        ssh_cmd = f"sshpass -e ssh -o StrictHostKeyChecking=no {user}@{host} -p {port}"
     else:
         ssh_cmd = f"ssh {user}@{host} -p {port}"
 
     bash_cmd = f"{ssh_cmd}; exec bash"
-    terminals = [
-        ["gnome-terminal", "--", "bash", "-c", bash_cmd],
-        ["xterm", "-e", "bash", "-c", bash_cmd],
-        ["konsole", "--noclose", "-e", "bash", "-c", bash_cmd],
-        ["xfce4-terminal", "-x", "bash", "-c", bash_cmd],
-        ["terminator", "-x", "bash", "-c", bash_cmd],
-        ["x-terminal-emulator", "-e", "bash", "-c", bash_cmd],
+
+    # (commande, variables d'environnement supplémentaires)
+    terminal_configs = [
+        # Sans portail D-Bus — les plus fiables
+        (["xterm", "-e", "bash", "-c", bash_cmd], {}),
+        (["kitty", "bash", "-c", bash_cmd], {}),
+        (["alacritty", "-e", "bash", "-c", bash_cmd], {}),
+        (["foot", "bash", "-c", bash_cmd], {}),
+        # ptyxis avec backend X11 forcé pour contourner le portail Wayland
+        (["ptyxis", "--", "bash", "-c", bash_cmd], {"GDK_BACKEND": "x11"}),
+        # Autres terminaux courants
+        (["gnome-terminal", "--", "bash", "-c", bash_cmd], {}),
+        (["konsole", "--noclose", "-e", "bash", "-c", bash_cmd], {}),
+        (["xfce4-terminal", "-x", "bash", "-c", bash_cmd], {}),
+        (["terminator", "-x", "bash", "-c", bash_cmd], {}),
+        (["x-terminal-emulator", "-e", "bash", "-c", bash_cmd], {}),
+        (["xdg-terminal-exec", "bash", "-c", bash_cmd], {}),
     ]
-    for cmd in terminals:
-        if shutil.which(cmd[0]):
-            subprocess.Popen(cmd)
+
+    for cmd, extra_env in terminal_configs:
+        if not shutil.which(cmd[0]):
+            continue
+        env = os.environ.copy()
+        env.update(sshpass_env)
+        env.update(extra_env)
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env,
+            )
             return {"ok": True, "terminal": cmd[0]}
-    return {"error": "Aucun émulateur de terminal trouvé (installez xterm ou gnome-terminal)"}
+        except Exception:
+            continue
+
+    return {
+        "error": (
+            "Aucun émulateur de terminal fonctionnel trouvé.\n"
+            "Installez xterm : sudo apt install xterm\n"
+            "Ou kitty : sudo apt install kitty"
+        )
+    }
 
 
 # ── Ping / WebSocket ──────────────────────────────────────────────────────────

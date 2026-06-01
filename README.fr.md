@@ -1,6 +1,6 @@
 # UpToco
 
-Un outil de gestion visuelle de parc informatique. Dessinez le plan de vos bureaux sur une grille, placez vos machines, surveillez leur état en temps réel et ouvrez des sessions SSH en un clic.
+Un outil de gestion visuelle de parc informatique. Importez le plan de vos bureaux, placez vos machines dessus, surveillez leur état en temps réel et ouvrez des sessions SSH en un clic.
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -10,23 +10,22 @@ Un outil de gestion visuelle de parc informatique. Dessinez le plan de vos burea
 
 ## Fonctionnalités
 
-- **Plan d'étage interactif** — dessinez des zones colorées en faisant glisser des rectangles ; les contours sont générés automatiquement
-- **Inventaire de machines** — créez vos machines (PC, serveur, laptop, imprimante, switch, routeur…) avec leurs identifiants SSH
+- **Plan d'étage** — importez n'importe quelle image (PNG, JPG, SVG…) comme fond de plan
+- **Inventaire de machines** — créez vos machines (PC, serveur, laptop, imprimante, switch, routeur…) avec leurs identifiants SSH et une couleur personnalisée
 - **Glisser-déposer** — faites glisser les machines depuis l'inventaire vers le plan
-- **Statut en temps réel** — ping ICMP toutes les 30 secondes avec indicateur vert/rouge par machine, résultats diffusés via WebSocket
+- **Statut en temps réel** — ping ICMP toutes les 30 s avec indicateur vert/rouge par machine, résultats diffusés via WebSocket
 - **Connexion SSH** — un clic ouvre un terminal avec les bons identifiants (mot de passe via `sshpass`, clé SSH supportée)
 - **Multi-étage** — créez et naviguez entre plusieurs étages, chacun avec son propre plan
-- **Annuler / Rétablir** — historique complet pour toutes les actions de dessin
-- **Zoom** — de 40 % à 200 %
-- **Export PNG** — capture le plan actuel en image
+- **Zoom & déplacement** — molette pour zoomer (30 %–400 %, centré sur le curseur), glisser le fond pour naviguer librement
+- **Redimensionnement** — faites glisser la poignée ↘ d'une machine pour changer sa taille
 - **Export / Import JSON** — sauvegarde et restauration complète des données
 
 ## Stack technique
 
-| Couche    | Technologie                                     |
-|-----------|-------------------------------------------------|
-| Backend   | Python · FastAPI · aiosqlite (SQLite)           |
-| Frontend  | React 18 · TypeScript · Tailwind CSS · Zustand · Vite |
+| Couche    | Technologie                                              |
+|-----------|----------------------------------------------------------|
+| Backend   | Python · FastAPI · aiosqlite (SQLite) · WebSocket        |
+| Frontend  | React 18 · TypeScript · Tailwind CSS · Zustand · Vite    |
 
 ## Prérequis
 
@@ -41,30 +40,27 @@ sudo apt install sshpass   # Debian / Ubuntu
 ## Installation et lancement
 
 ```bash
-# Cloner
-git clone https://github.com/votre-pseudo/uptoco.git
-cd uptoco
-
-# Installer les dépendances Python
-pip install -r backend/requirements.txt
-
-# Construire le frontend et démarrer le serveur
-chmod +x start.sh
-./start.sh
+curl -sSL https://raw.githubusercontent.com/Derbosoft/uptoco/main/get.sh | bash
+bash install.sh
+bash start.sh
 ```
 
 L'application est disponible sur **http://localhost:8000**.
 
-> `start.sh` installe les dépendances Node automatiquement au premier lancement, construit le frontend, puis démarre le backend FastAPI qui sert à la fois l'API et le frontend compilé.
+| Script | Rôle |
+|--------|------|
+| `curl … \| bash` | Clone le dépôt et crée les scripts locaux `install.sh` / `start.sh` |
+| `bash install.sh` | Crée le venv Python, installe les dépendances, compile le frontend |
+| `bash start.sh` | Corrige les permissions si besoin, recompile le frontend, démarre le backend |
 
 ## Mode développement
 
 ```bash
 # Terminal 1 — backend (rechargement à chaud)
 cd backend
-uvicorn main:app --reload --port 8000
+../.venv/bin/uvicorn main:app --reload --port 8000
 
-# Terminal 2 — frontend (serveur de développement Vite avec proxy)
+# Terminal 2 — frontend (serveur Vite avec proxy vers :8000)
 cd frontend
 npm install
 npm run dev        # → http://localhost:5173
@@ -75,35 +71,39 @@ npm run dev        # → http://localhost:5173
 ```
 uptoco/
 ├── backend/
-│   ├── main.py          # Application FastAPI (API + WebSocket + fichiers statiques)
+│   ├── main.py          # App FastAPI — API REST, WebSocket, SSH, fichiers statiques
 │   ├── requirements.txt
-│   └── uptoco.db        # Base de données SQLite (créée automatiquement)
+│   ├── uptoco.db        # Base SQLite (créée automatiquement au premier lancement)
+│   └── uploads/         # Images de plans importées
 ├── frontend/
 │   ├── src/
-│   │   ├── components/  # Grid, Sidebar, TopNav, MachinePopup, modales…
+│   │   ├── components/  # FloorCanvas, Sidebar, TopNav, MachineModal, MachinePopup
 │   │   ├── views/       # InventoryView, PlansView
 │   │   ├── store.ts     # État global Zustand
 │   │   └── types.ts     # Types TypeScript partagés
 │   └── dist/            # Frontend compilé (servi par FastAPI)
-└── start.sh             # Script de build et lancement en une commande
+├── get.sh               # Script de téléchargement (clone + création des wrappers)
+├── install.sh           # Installation des dépendances + build du frontend
+└── start.sh             # Correction permissions + build frontend + démarrage backend
 ```
 
 ## Utilisation
 
 1. **Ajouter un étage** — cliquez sur *+ Ajouter* dans la section étage de la barre latérale
-2. **Dessiner des zones** — sélectionnez l'outil **▭**, choisissez une couleur, puis cliquez-glissez sur la grille
-3. **Effacer** — l'outil **✕** supprime les rectangles et leurs bordures
-4. **Ajouter des machines** — allez dans la vue *Inventaire*, renseignez les identifiants SSH, sauvegardez
-5. **Placer les machines** — faites glisser une machine depuis la barre latérale vers la grille
-6. **Se connecter en SSH** — cliquez sur une machine placée pour ouvrir le popup, puis appuyez sur *Connexion SSH*
-7. **Sauvegarder** — utilisez *⬇ Export* dans la barre supérieure pour télécharger une sauvegarde JSON, et *⬆ Import* pour restaurer
+2. **Importer un plan** — glissez une image sur le canvas, ou cliquez *🖼 Changer l'image*
+3. **Ajouter des machines** — allez dans la vue *Inventaire*, renseignez les identifiants SSH et la couleur, sauvegardez
+4. **Placer les machines** — faites glisser une machine depuis la barre latérale vers le plan
+5. **Naviguer** — molette pour zoomer (centré sur le curseur), glisser le fond pour se déplacer
+6. **Se connecter en SSH** — cliquez sur une machine placée → *Connexion SSH* dans le popup
+7. **Redimensionner une machine** — faites glisser la poignée ↘ en bas à droite de la carte machine
+8. **Sauvegarder** — *⬇ Export* télécharge une sauvegarde JSON ; *⬆ Import* la restaure
 
 ## Authentification SSH
 
-| Type         | Prérequis                              |
-|--------------|----------------------------------------|
-| Mot de passe | `sshpass` doit être installé           |
-| Clé SSH      | Chemin absolu vers le fichier `.pem` / clé privée |
+| Type         | Prérequis                                               |
+|--------------|---------------------------------------------------------|
+| Mot de passe | `sshpass` installé (`sudo apt install sshpass`)         |
+| Clé SSH      | Chemin absolu vers le fichier `.pem` / clé privée       |
 
 ## Licence
 

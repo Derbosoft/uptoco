@@ -2,15 +2,21 @@
 set -e
 cd "$(dirname "$0")"
 
+# Correction des permissions si dist a été créé par root
+if [ -d "frontend/dist" ] && [ ! -w "frontend/dist" ]; then
+  echo "Correction des permissions de frontend/dist (sudo requis)..."
+  sudo chown -R "$USER:$USER" frontend/dist
+fi
+
 # Build frontend
 echo "Build du frontend..."
 cd frontend
-[ ! -d node_modules ] && npm install
 npm run build
 cd ..
 
-# Start backend (serves API + frontend)
 echo ""
-echo "Démarrage du backend..."
+echo "Démarrage d'UpToco sur http://localhost:8000"
+echo "Accès réseau : http://$(hostname -I | awk '{print $1}'):8000"
+echo ""
 cd backend
-~/.local/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+../.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000

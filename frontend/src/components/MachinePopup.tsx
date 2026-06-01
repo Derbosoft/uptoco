@@ -22,11 +22,13 @@ export default function MachinePopup({ placed, position, onClose, showNotif }: P
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
+      // Ne pas fermer si le modal d'édition est ouvert (clic dans MachineModal)
+      if (editOpen) return
       if (ref.current && !ref.current.contains(e.target as Node)) onClose()
     }
     setTimeout(() => document.addEventListener('mousedown', handler), 50)
     return () => document.removeEventListener('mousedown', handler)
-  }, [onClose])
+  }, [onClose, editOpen])
 
   const handleSSH = async () => {
     const res = await openSSH(placed.machine_id)
@@ -46,7 +48,7 @@ export default function MachinePopup({ placed, position, onClose, showNotif }: P
 
   return (
     <>
-      <div ref={ref} style={style}>
+      <div ref={ref} style={style} onClick={e => e.stopPropagation()}>
         <div className="bg-gray-800 border border-gray-600 rounded-xl shadow-2xl p-4 w-52">
           <div className="flex items-start justify-between mb-3">
             <div>

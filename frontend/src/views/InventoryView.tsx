@@ -4,7 +4,8 @@ import { Machine, MACHINE_ICONS, MACHINE_TYPES } from '../types'
 import MachineModal from '../components/MachineModal'
 
 export default function InventoryView() {
-  const { machines, statuses, searchQuery, setSearchQuery, deleteMachine, openSSH } = useStore()
+  const [searchQuery, setSearchQuery] = useState('')
+  const { machines, statuses, deleteMachine, openSSH } = useStore()
   const [editingMachine, setEditingMachine] = useState<Partial<Machine> | null>(null)
   const [typeFilter, setTypeFilter] = useState<string>('all')
   const [notif, setNotif] = useState<{ msg: string; ok: boolean } | null>(null)
