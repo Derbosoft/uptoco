@@ -7,12 +7,16 @@ from pydantic import BaseModel
 from typing import Any, Dict, List
 import asyncio
 import aiosqlite
+import fcntl
 import json
 import os
+import pty
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
+import termios
 import uuid
 from pathlib import Path
 
@@ -461,6 +465,114 @@ async def open_ssh(machine_id: str):
             "Ou kitty : sudo apt install kitty"
         )
     }
+
+
+# ── Terminal SSH WebSocket (PTY) ─────────────────────────────────────────────
+
+@app.websocket("/ws/ssh/{machine_id}")
+async def ws_ssh_terminal(ws: WebSocket, machine_id: str):
+    await ws.accept()
+
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = row_factory
+        async with db.execute("SELECT * FROM machines WHERE id=?", (machine_id,)) as c:
+            m = await c.fetchone()
+
+    if not m or not m.get("ip"):
+        await ws.send_bytes(b"\r\nErreur : machine introuvable ou adresse IP manquante.\r\n")
+        return
+
+    user = m["ssh_user"] or "root"
+    host = m["ip"]
+    port = str(m["ssh_port"] or 22)
+    env  = os.environ.copy()
+
+    if m["ssh_auth_type"] == "key" and m["ssh_key_path"]:
+        cmd = ["ssh", "-i", m["ssh_key_path"], "-p", port,
+               "-o", "StrictHostKeyChecking=no", f"{user}@{host}"]
+    elif m["ssh_auth_type"] == "password" and m["ssh_password"]:
+        if not shutil.which("sshpass"):
+            await ws.send_bytes(b"\r\nsshpass n'est pas installe. Lancez : sudo apt install sshpass\r\n")
+            return
+        env["SSHPASS"] = m["ssh_password"]
+        cmd = ["sshpass", "-e", "ssh", "-p", port,
+               "-o", "StrictHostKeyChecking=no", f"{user}@{host}"]
+    else:
+        cmd = ["ssh", "-p", port, f"{user}@{host}"]
+
+    master_fd, slave_fd = pty.openpty()
+    loop = asyncio.get_event_loop()
+    pty_queue: asyncio.Queue = asyncio.Queue()
+
+    def _on_readable():
+        try:
+            data = os.read(master_fd, 4096)
+            pty_queue.put_nowait(data)
+        except OSError:
+            loop.remove_reader(master_fd)
+            pty_queue.put_nowait(None)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            env=env, close_fds=True,
+        )
+        os.close(slave_fd)
+        loop.add_reader(master_fd, _on_readable)
+
+        async def pty_to_ws():
+            while True:
+                data = await pty_queue.get()
+                if data is None:
+                    break
+                try:
+                    await ws.send_bytes(data)
+                except Exception:
+                    break
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+        async def ws_to_pty():
+            try:
+                while True:
+                    msg = await ws.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        break
+                    if msg.get("bytes"):
+                        os.write(master_fd, msg["bytes"])
+                    elif msg.get("text"):
+                        try:
+                            ev = json.loads(msg["text"])
+                            if ev.get("type") == "resize":
+                                cols = max(1, int(ev.get("cols", 80)))
+                                rows = max(1, int(ev.get("rows", 24)))
+                                fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                                            struct.pack("HHHH", rows, cols, 0, 0))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        await asyncio.gather(pty_to_ws(), ws_to_pty(), return_exceptions=True)
+
+    finally:
+        loop.remove_reader(master_fd)
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
 
 
 # ── Ping / WebSocket ──────────────────────────────────────────────────────────

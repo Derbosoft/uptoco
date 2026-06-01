@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { PlacedMachine } from '../types'
 import { useStore } from '../store'
 import MachineModal from './MachineModal'
+import SshTerminalModal from './SshTerminalModal'
 
 interface Props {
   placed: PlacedMachine
@@ -11,40 +12,44 @@ interface Props {
 }
 
 export default function MachinePopup({ placed, position, onClose, showNotif }: Props) {
-  const { statuses, machines, openSSH, removeMachine } = useStore()
-  const [editOpen, setEditOpen] = useState(false)
+  const { statuses, machines, removeMachine } = useStore()
+  const [editOpen, setEditOpen]       = useState(false)
+  const [terminalOpen, setTerminalOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
   const machine = machines.find(m => m.id === placed.machine_id)
-  const status = statuses[placed.machine_id]
-  const dot = status === undefined ? '#9ca3af' : status ? '#22c55e' : '#ef4444'
-  const label = status === undefined ? 'Inconnu' : status ? 'En ligne' : 'Hors ligne'
+  const status  = statuses[placed.machine_id]
+  const dot     = status === undefined ? '#9ca3af' : status ? '#22c55e' : '#ef4444'
+  const label   = status === undefined ? 'Inconnu'  : status ? 'En ligne' : 'Hors ligne'
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      // Ne pas fermer si le modal d'édition est ouvert (clic dans MachineModal)
-      if (editOpen) return
+      if (editOpen || terminalOpen) return
       if (ref.current && !ref.current.contains(e.target as Node)) onClose()
     }
     setTimeout(() => document.addEventListener('mousedown', handler), 50)
     return () => document.removeEventListener('mousedown', handler)
-  }, [onClose, editOpen])
-
-  const handleSSH = async () => {
-    const res = await openSSH(placed.machine_id)
-    if (res.error) showNotif(res.error, false)
-    else showNotif(`Terminal ouvert (${res.terminal})`)
-    onClose()
-  }
+  }, [onClose, editOpen, terminalOpen])
 
   const style: React.CSSProperties = position
     ? {
         position: 'fixed',
-        top: Math.min(position.y, window.innerHeight - 260),
+        top:  Math.min(position.y, window.innerHeight - 260),
         left: Math.min(position.x + 12, window.innerWidth - 240),
         zIndex: 50,
       }
     : { position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%,-50%)', zIndex: 50 }
+
+  if (terminalOpen) {
+    return (
+      <SshTerminalModal
+        machineId={placed.machine_id}
+        machineName={placed.name}
+        machineIp={placed.ip || ''}
+        onClose={() => { setTerminalOpen(false); onClose() }}
+      />
+    )
+  }
 
   return (
     <>
@@ -72,8 +77,10 @@ export default function MachinePopup({ placed, position, onClose, showNotif }: P
           )}
 
           <div className="flex flex-col gap-2">
-            <button onClick={handleSSH}
-              className="w-full bg-blue-600 hover:bg-blue-500 text-white rounded-lg py-2 text-xs font-semibold flex items-center justify-center gap-2">
+            <button
+              onClick={() => setTerminalOpen(true)}
+              className="w-full bg-blue-600 hover:bg-blue-500 text-white rounded-lg py-2 text-xs font-semibold flex items-center justify-center gap-2"
+            >
               ⌨ Connexion SSH
             </button>
             <div className="flex gap-2">

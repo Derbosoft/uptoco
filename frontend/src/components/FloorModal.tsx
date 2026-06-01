@@ -41,7 +41,7 @@ export default function FloorModal({ id, initialName, onClose, onSaved }: Props)
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose} onMouseDown={e => e.stopPropagation()}>
       <div className="bg-gray-800 rounded-xl shadow-2xl p-6 w-80 border border-gray-600"
         onClick={e => e.stopPropagation()}>
         <h2 className="text-lg font-bold mb-4">{isEdit ? 'Modifier l\'étage' : 'Nouvel étage'}</h2>
