@@ -14,7 +14,7 @@ A visual computer park management tool. Upload your office floor plan, place mac
 - **Machine inventory** — create machines (PC, server, laptop, printer, switch, router…) with SSH credentials and a custom color
 - **Drag & drop** — drag machines from the inventory onto the floor plan
 - **Real-time status** — ICMP ping every 30 s with green/red indicator per machine; results broadcast via WebSocket
-- **SSH connection** — one click opens a terminal with the correct credentials (password via `sshpass`, key file supported)
+- **SSH connection** — one click opens a full terminal **in the browser** (xterm.js); the SSH session runs from the server (password via `sshpass`, key file supported)
 - **Multi-floor** — create and switch between floors, each with its own plan
 - **Zoom & pan** — scroll wheel to zoom (30 %–400 %, centered on cursor), drag the background to pan freely
 - **Machine resize** — drag the resize handle on any placed machine to scale it
@@ -53,6 +53,20 @@ The app is available at **http://localhost:8000**.
 | `bash install.sh` | Creates the Python venv, installs dependencies, builds the frontend |
 | `bash start.sh` | Fixes permissions if needed, rebuilds the frontend, starts the FastAPI backend |
 
+### Production (auto-restart on crash + logs)
+
+For a server that should start at boot and recover automatically, install the systemd service instead of running `start.sh` manually:
+
+```bash
+bash install-service.sh
+```
+
+```bash
+sudo systemctl status uptoco     # status
+journalctl -u uptoco -f          # live logs
+sudo systemctl restart uptoco    # restart
+```
+
 ## Development mode
 
 ```bash
@@ -84,7 +98,8 @@ uptoco/
 │   └── dist/            # Built frontend (served by FastAPI)
 ├── get.sh               # Download script (clone repo + create wrappers)
 ├── install.sh           # Dependency installer + frontend build
-└── start.sh             # Permission fix + frontend build + backend start
+├── start.sh             # Permission fix + frontend build + backend start
+└── install-service.sh   # Install a systemd service (auto-restart + logs)
 ```
 
 ## Usage
@@ -100,10 +115,14 @@ uptoco/
 
 ## SSH authentication
 
-| Type     | Requirement                                        |
-|----------|----------------------------------------------------|
-| Password | `sshpass` installed (`sudo apt install sshpass`)   |
-| Key file | Absolute path to the `.pem` / private key file     |
+The terminal runs in the browser but the SSH connection is opened **from the server**, so credentials (key files) must be present **on the server**, not on the client machine.
+
+| Type     | Requirement                                                         |
+|----------|---------------------------------------------------------------------|
+| Password | `sshpass` installed on the server (`sudo apt install sshpass`)       |
+| Key file | Absolute path, on the server, to the `.pem` / private key file      |
+
+> **Security note:** UpToco has no built-in authentication and stores SSH passwords in plain text in `uptoco.db`. Anyone who can reach the web interface can read every credential and open a root shell on any machine. Run it only on a trusted network, and ideally behind a reverse proxy (e.g. Caddy) that adds a login and HTTPS.
 
 ## License
 

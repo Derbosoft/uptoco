@@ -11,11 +11,8 @@ import fcntl
 import json
 import os
 import pty
-import shlex
 import shutil
-import socket
 import struct
-import subprocess
 import termios
 import uuid
 from pathlib import Path
@@ -207,6 +204,7 @@ async def update_machine(mid: str, m: MachineIn):
 @app.delete("/api/machines/{mid}")
 async def delete_machine(mid: str):
     async with aiosqlite.connect(DB) as db:
+        await db.execute("PRAGMA foreign_keys = ON")  # sinon ON DELETE CASCADE ne fait rien
         await db.execute("DELETE FROM machines WHERE id=?", (mid,))
         await db.commit()
     return {"ok": True}
@@ -243,8 +241,18 @@ async def update_floor(fid: str, f: FloorIn):
 @app.delete("/api/floors/{fid}")
 async def delete_floor(fid: str):
     async with aiosqlite.connect(DB) as db:
+        await db.execute("PRAGMA foreign_keys = ON")  # sinon ON DELETE CASCADE ne fait rien
+        db.row_factory = row_factory
+        async with db.execute("SELECT image_path FROM floor_plans WHERE floor_id=?", (fid,)) as c:
+            plan = await c.fetchone()
         await db.execute("DELETE FROM floors WHERE id=?", (fid,))
         await db.commit()
+    # Supprime l'image du plan sur le disque (sinon elle reste orpheline)
+    if plan and plan.get("image_path"):
+        try:
+            (UPLOADS / plan["image_path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
     return {"ok": True}
 
 
@@ -281,8 +289,17 @@ async def upload_image(fid: str, file: UploadFile = File(...)):
     content = await file.read()
     (UPLOADS / filename).write_bytes(content)
     async with aiosqlite.connect(DB) as db:
+        db.row_factory = row_factory
+        async with db.execute("SELECT image_path FROM floor_plans WHERE floor_id=?", (fid,)) as c:
+            old = await c.fetchone()
         await db.execute("UPDATE floor_plans SET image_path=? WHERE floor_id=?", (filename, fid))
         await db.commit()
+    # Supprime l'ancienne image si son nom diffère (changement d'extension)
+    if old and old.get("image_path") and old["image_path"] != filename:
+        try:
+            (UPLOADS / old["image_path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
     return {"ok": True, "url": f"/uploads/{filename}"}
 
 
@@ -372,13 +389,13 @@ async def import_data(body: ImportBody):
         for m in body.machines:
             await db.execute(
                 "INSERT INTO machines VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (m["id"], m["name"], m["type"], m.get("ip", ""), m.get("ssh_user", "root"),
+                (m["id"], m["name"], m.get("type", "pc"), m.get("ip", ""), m.get("ssh_user", "root"),
                  m.get("ssh_port", 22), m.get("ssh_auth_type", "password"),
                  m.get("ssh_key_path", ""), m.get("ssh_password", ""), m.get("notes", ""),
                  m.get("color", "#6b7280")),
             )
         for f in body.floors:
-            await db.execute("INSERT INTO floors VALUES (?,?,?)", (f["id"], f["name"], f["position"]))
+            await db.execute("INSERT INTO floors VALUES (?,?,?)", (f["id"], f["name"], f.get("position", 0)))
         for p in body.plans:
             await db.execute(
                 "INSERT INTO floor_plans (floor_id, image_path) VALUES (?,?)",
@@ -393,78 +410,6 @@ async def import_data(body: ImportBody):
                 )
         await db.commit()
     return {"ok": True}
-
-
-# ── SSH ───────────────────────────────────────────────────────────────────────
-
-@app.post("/api/ssh/{machine_id}")
-async def open_ssh(machine_id: str):
-    async with aiosqlite.connect(DB) as db:
-        db.row_factory = row_factory
-        async with db.execute("SELECT * FROM machines WHERE id=?", (machine_id,)) as c:
-            m = await c.fetchone()
-    if not m:
-        raise HTTPException(404, "Machine introuvable")
-
-    user, host, port = m["ssh_user"] or "root", m["ip"], m["ssh_port"] or 22
-
-    sshpass_env: Dict[str, str] = {}
-    if m["ssh_auth_type"] == "key" and m["ssh_key_path"]:
-        ssh_cmd = f"ssh -i {shlex.quote(m['ssh_key_path'])} {user}@{host} -p {port}"
-    elif m["ssh_auth_type"] == "password" and m["ssh_password"]:
-        if not shutil.which("sshpass"):
-            return {"error": "sshpass n'est pas installé. Lancez : sudo apt install sshpass"}
-        # Utilise SSHPASS env var (-e) pour ne pas exposer le mot de passe dans ps aux
-        sshpass_env = {"SSHPASS": m["ssh_password"]}
-        ssh_cmd = f"sshpass -e ssh -o StrictHostKeyChecking=no {user}@{host} -p {port}"
-    else:
-        ssh_cmd = f"ssh {user}@{host} -p {port}"
-
-    bash_cmd = f"{ssh_cmd}; exec bash"
-
-    # (commande, variables d'environnement supplémentaires)
-    terminal_configs = [
-        # Sans portail D-Bus — les plus fiables
-        (["xterm", "-e", "bash", "-c", bash_cmd], {}),
-        (["kitty", "bash", "-c", bash_cmd], {}),
-        (["alacritty", "-e", "bash", "-c", bash_cmd], {}),
-        (["foot", "bash", "-c", bash_cmd], {}),
-        # ptyxis avec backend X11 forcé pour contourner le portail Wayland
-        (["ptyxis", "--", "bash", "-c", bash_cmd], {"GDK_BACKEND": "x11"}),
-        # Autres terminaux courants
-        (["gnome-terminal", "--", "bash", "-c", bash_cmd], {}),
-        (["konsole", "--noclose", "-e", "bash", "-c", bash_cmd], {}),
-        (["xfce4-terminal", "-x", "bash", "-c", bash_cmd], {}),
-        (["terminator", "-x", "bash", "-c", bash_cmd], {}),
-        (["x-terminal-emulator", "-e", "bash", "-c", bash_cmd], {}),
-        (["xdg-terminal-exec", "bash", "-c", bash_cmd], {}),
-    ]
-
-    for cmd, extra_env in terminal_configs:
-        if not shutil.which(cmd[0]):
-            continue
-        env = os.environ.copy()
-        env.update(sshpass_env)
-        env.update(extra_env)
-        try:
-            subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                env=env,
-            )
-            return {"ok": True, "terminal": cmd[0]}
-        except Exception:
-            continue
-
-    return {
-        "error": (
-            "Aucun émulateur de terminal fonctionnel trouvé.\n"
-            "Installez xterm : sudo apt install xterm\n"
-            "Ou kitty : sudo apt install kitty"
-        )
-    }
 
 
 # ── Terminal SSH WebSocket (PTY) ─────────────────────────────────────────────
@@ -503,6 +448,7 @@ async def ws_ssh_terminal(ws: WebSocket, machine_id: str):
     master_fd, slave_fd = pty.openpty()
     loop = asyncio.get_event_loop()
     pty_queue: asyncio.Queue = asyncio.Queue()
+    proc = None
 
     def _on_readable():
         try:
@@ -518,6 +464,7 @@ async def ws_ssh_terminal(ws: WebSocket, machine_id: str):
             env=env, close_fds=True,
         )
         os.close(slave_fd)
+        slave_fd = -1
         loop.add_reader(master_fd, _on_readable)
 
         async def pty_to_ws():
@@ -563,12 +510,19 @@ async def ws_ssh_terminal(ws: WebSocket, machine_id: str):
         await asyncio.gather(pty_to_ws(), ws_to_pty(), return_exceptions=True)
 
     finally:
+        # Ferme le slave_fd s'il n'a pas pu l'être (échec du spawn)
+        if slave_fd != -1:
+            try:
+                os.close(slave_fd)
+            except Exception:
+                pass
         loop.remove_reader(master_fd)
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
         try:
             os.close(master_fd)
         except Exception:
@@ -578,6 +532,8 @@ async def ws_ssh_terminal(ws: WebSocket, machine_id: str):
 # ── Ping / WebSocket ──────────────────────────────────────────────────────────
 
 async def ping_host(ip: str) -> bool:
+    # Tentative 1 : ping ICMP
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "ping", "-c", "1", "-W", "1", ip,
@@ -586,36 +542,65 @@ async def ping_host(ip: str) -> bool:
         await asyncio.wait_for(proc.wait(), timeout=3.0)
         if proc.returncode == 0:
             return True
+    except asyncio.TimeoutError:
+        # Tue le ping qui traîne pour éviter les processus zombies + fuite de fd
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
     except Exception:
-        pass
+        # create_subprocess_exec a échoué ; s'assurer qu'aucun proc ne traîne
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+
+    # Tentative 2 : connexion TCP sur le port 22 (100 % asyncio, sans thread)
+    writer = None
     try:
-        loop = asyncio.get_event_loop()
-        conn = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: socket.create_connection((ip, 22), 1)),
-            timeout=2.0,
-        )
-        conn.close()
+        _, writer = await asyncio.wait_for(asyncio.open_connection(ip, 22), timeout=2.0)
         return True
     except Exception:
         return False
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 async def ping_loop():
     while True:
-        async with aiosqlite.connect(DB) as db:
-            db.row_factory = row_factory
-            async with db.execute("SELECT id, ip FROM machines WHERE ip != ''") as c:
-                machines = await c.fetchall()
-        if machines:
-            results = await asyncio.gather(*[ping_host(m["ip"]) for m in machines])
-            statuses = {m["id"]: r for m, r in zip(machines, results)}
-            pc_statuses.update(statuses)
-            msg = json.dumps({"type": "status", "data": statuses})
-            for ws in connections[:]:
-                try:
-                    await ws.send_text(msg)
-                except Exception:
-                    connections.remove(ws)
+        try:
+            async with aiosqlite.connect(DB) as db:
+                db.row_factory = row_factory
+                async with db.execute("SELECT id, ip FROM machines WHERE ip != ''") as c:
+                    machines = await c.fetchall()
+            if machines:
+                # return_exceptions=True : une erreur sur un ping ne fait pas planter le gather
+                results = await asyncio.gather(
+                    *[ping_host(m["ip"]) for m in machines],
+                    return_exceptions=True,
+                )
+                statuses = {m["id"]: (r is True) for m, r in zip(machines, results)}
+                pc_statuses.update(statuses)
+                msg = json.dumps({"type": "status", "data": statuses})
+                for ws in connections[:]:
+                    try:
+                        await ws.send_text(msg)
+                    except Exception:
+                        try:
+                            connections.remove(ws)
+                        except ValueError:
+                            pass
+        except Exception:
+            # La boucle ne doit jamais mourir, sinon les statuts se figent définitivement
+            pass
         await asyncio.sleep(30)
 
 
@@ -645,5 +630,8 @@ if DIST.exists():
 
     @app.get("/{full_path:path}")
     def serve_spa(full_path: str):
-        f = DIST / full_path
-        return FileResponse(f if f.exists() and f.is_file() else DIST / "index.html")
+        # Résolution confinée à DIST pour bloquer la traversée de chemin (../../etc/passwd)
+        target = (DIST / full_path).resolve()
+        if target.is_file() and target.is_relative_to(DIST.resolve()):
+            return FileResponse(target)
+        return FileResponse(DIST / "index.html")

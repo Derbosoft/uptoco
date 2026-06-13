@@ -33,8 +33,6 @@ interface AppStore {
   scaleMachine: (machineId: string, scale: number) => void
   saveMachineScale: (machineId: string) => Promise<void>
   removeMachine: (machineId: string) => Promise<void>
-
-  openSSH: (machineId: string) => Promise<{ ok?: boolean; terminal?: string; error?: string }>
 }
 
 export const useStore = create<AppStore>((set, get) => ({
@@ -226,11 +224,5 @@ export const useStore = create<AppStore>((set, get) => ({
         placed_machines: st.plan.placed_machines.filter(pm => pm.machine_id !== machineId),
       } : st.plan,
     }))
-  },
-
-  // ── SSH ───────────────────────────────────────────────────────────────────
-
-  openSSH: async (machineId) => {
-    return fetch(`/api/ssh/${machineId}`, { method: 'POST' }).then(r => r.json())
   },
 }))

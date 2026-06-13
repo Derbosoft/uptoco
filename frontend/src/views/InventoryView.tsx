@@ -2,23 +2,19 @@ import { useState } from 'react'
 import { useStore } from '../store'
 import { Machine, MACHINE_ICONS, MACHINE_TYPES } from '../types'
 import MachineModal from '../components/MachineModal'
+import SshTerminalModal from '../components/SshTerminalModal'
 
 export default function InventoryView() {
   const [searchQuery, setSearchQuery] = useState('')
-  const { machines, statuses, deleteMachine, openSSH } = useStore()
+  const { machines, statuses, deleteMachine } = useStore()
   const [editingMachine, setEditingMachine] = useState<Partial<Machine> | null>(null)
+  const [sshMachine, setSshMachine] = useState<Machine | null>(null)
   const [typeFilter, setTypeFilter] = useState<string>('all')
   const [notif, setNotif] = useState<{ msg: string; ok: boolean } | null>(null)
 
   const showNotif = (msg: string, ok = true) => {
     setNotif({ msg, ok })
     setTimeout(() => setNotif(null), 3000)
-  }
-
-  const handleSSH = async (id: string) => {
-    const res = await openSSH(id)
-    if (res.error) showNotif(res.error, false)
-    else showNotif(`Terminal ouvert (${res.terminal})`)
   }
 
   const q = searchQuery.toLowerCase()
@@ -117,7 +113,7 @@ export default function InventoryView() {
                   <td className="px-4 py-3">
                     <div className="flex gap-2">
                       {m.ip && (
-                        <button onClick={() => handleSSH(m.id)}
+                        <button onClick={() => setSshMachine(m)}
                           className="bg-blue-700 hover:bg-blue-600 text-white px-2 py-1 rounded text-xs">SSH</button>
                       )}
                       <button onClick={() => setEditingMachine(m)}
@@ -139,6 +135,15 @@ export default function InventoryView() {
           machine={editingMachine}
           onClose={() => setEditingMachine(null)}
           onSaved={() => { setEditingMachine(null); showNotif('Machine enregistrée') }}
+        />
+      )}
+
+      {sshMachine && (
+        <SshTerminalModal
+          machineId={sshMachine.id}
+          machineName={sshMachine.name}
+          machineIp={sshMachine.ip || ''}
+          onClose={() => setSshMachine(null)}
         />
       )}
 
